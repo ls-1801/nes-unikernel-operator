@@ -1,4 +1,5 @@
-use crate::{Document, Error};
+use crate::query_submission::QuerySubmission;
+use crate::Error;
 use kube::ResourceExt;
 use prometheus::{histogram_opts, opts, HistogramVec, IntCounter, IntCounterVec, Registry};
 use tokio::time::Instant;
@@ -48,7 +49,7 @@ impl Metrics {
         Ok(self)
     }
 
-    pub fn reconcile_failure(&self, doc: &Document, e: &Error) {
+    pub fn reconcile_failure(&self, doc: &QuerySubmission, e: &Error) {
         self.failures
             .with_label_values(&[doc.name_any().as_ref(), e.metric_label().as_ref()])
             .inc()

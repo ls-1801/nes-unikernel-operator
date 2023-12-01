@@ -16,6 +16,9 @@ Apply the CRD from [cached file](yaml/crd.yaml), or pipe it from `crdgen` to pic
 cargo run --bin crdgen | kubectl apply -f -
 ```
 
+```sh
+cargo run --bin crdgen | minikube kubectl -- apply -f -
+```
 ### Controller
 
 Install the controller via `helm` by setting your preferred settings. For defaults:
