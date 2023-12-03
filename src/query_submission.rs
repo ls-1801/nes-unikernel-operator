@@ -1,4 +1,3 @@
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -56,7 +55,7 @@ pub struct Topology {
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 #[cfg_attr(test, derive(Default))]
 pub struct Node {
-    #[serde(rename="ip")]
+    #[serde(rename = "ip")]
     host: String,
     port: usize,
     resources: usize,
@@ -89,8 +88,8 @@ pub enum SchemaType {
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 pub struct SchemaField {
-    #[serde(rename="type")]
+    #[serde(rename = "type")]
     pub field_type: SchemaType,
-    #[serde(rename="name")]
+    #[serde(rename = "name")]
     pub field_name: String,
 }

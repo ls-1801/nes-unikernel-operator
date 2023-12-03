@@ -495,6 +495,7 @@ dependencies = [
  "hyper",
  "k8s-openapi",
  "kube",
+ "openapi-struct-gen",
  "opentelemetry",
  "opentelemetry-otlp",
  "prometheus",
@@ -1364,6 +1365,12 @@ name = "once_cell"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd8b5dd2ae5ed71462c540258bedcb51965123ad7e7ccf4b9a8cafaa4a63576d"
+
+[[package]]
+name = "openapi-struct-gen"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f20ccce9d4ec99ce58f9911617e16bf614a947df2274465623e57e995e42974"
 
 [[package]]
 name = "openssl-probe"

@@ -163,9 +163,17 @@ impl ApiServerVerifier {
             Some(pod_name)
         );
 
-        for container_spec in postdata.get("spec").unwrap().get("containers").unwrap().as_array().unwrap().iter() {
-           assert!(container_spec.get("name").is_some());
-           assert!(container_spec.get("image").is_some());
+        for container_spec in postdata
+            .get("spec")
+            .unwrap()
+            .get("containers")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+        {
+            assert!(container_spec.get("name").is_some());
+            assert!(container_spec.get("image").is_some());
         }
 
         // then pass through the body

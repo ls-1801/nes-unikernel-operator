@@ -4,8 +4,5 @@ use kube::CustomResourceExt;
 use query_submission::*;
 
 fn main() {
-    print!(
-        "{}",
-        serde_yaml::to_string(&QuerySubmission::crd()).unwrap()
-    )
+    print!("{}", serde_yaml::to_string(&QuerySubmission::crd()).unwrap())
 }

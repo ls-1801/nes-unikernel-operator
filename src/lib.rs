@@ -47,6 +47,7 @@ impl Error {
 
 /// Expose all controller components used by main
 pub mod controller;
+mod datavolumes;
 mod query_submission;
 
 pub use crate::controller::*;
