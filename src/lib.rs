@@ -29,6 +29,10 @@ pub enum Error {
 pub enum QuerySubmissionFailureReason {
     #[error("Job Failed Reason: {0}")]
     Job(String),
+    #[error("VM Failed Reason: {0}")]
+    VM(String),
+    #[error("VM {0} does not have a DataVolume")]
+    VMWithoutDataVolume(String),
 }
 
 #[derive(Debug)]
@@ -49,6 +53,7 @@ impl Error {
 pub mod controller;
 mod datavolumes;
 mod query_submission;
+mod virtualmachines;
 
 pub use crate::controller::*;
 

@@ -1,17 +1,19 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::task::Wake;
 use std::vec;
 
 use chrono::{DateTime, Utc};
+use futures::future::try_join_all;
 use futures::StreamExt;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, HostPathVolumeSource,
-    PersistentVolume, PersistentVolumeSpec, PodSpec, PodTemplateSpec, VolumeMount,
+    ConfigMap, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, PodSpec, PodTemplateSpec, VolumeMount,
 };
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::PostParams;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::{DeleteParams, PostParams};
+use kube::client::AuthError;
 use kube::{
     api::{Api, ListParams, Patch, PatchParams, ResourceExt},
     client::Client,
@@ -23,19 +25,16 @@ use kube::{
     },
     Resource,
 };
-use prometheus::core::Collector;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
 use tokio::{sync::RwLock, time::Duration};
 use tracing::*;
 
-use crate::datavolumes::*;
+use crate::datavolumes::DataVolume;
 use crate::query_submission::*;
-use crate::{
-    controller, query_submission, telemetry, Error, Metrics, NeededChanges, QuerySubmissionFailureReason,
-    Result,
-};
+use crate::virtualmachines::*;
+use crate::{controller, telemetry, Error, Metrics, NeededChanges, QuerySubmissionFailureReason, Result};
 
 pub static QUERY_FINALIZER: &str = "query.nes.rs";
 
@@ -48,6 +47,19 @@ pub struct Context {
     pub diagnostics: Arc<RwLock<Diagnostics>>,
     /// Prometheus metrics
     pub metrics: Metrics,
+}
+
+#[derive(Clone, Default, Debug)]
+pub enum InternalQueryState {
+    #[default]
+    Submitted,
+    Pending,
+    Building,
+    Deploying(Vec<DataVolume>),
+    DeploymentPending,
+    Starting,
+    Running,
+    Stopped,
 }
 
 #[instrument(skip(ctx, doc), fields(trace_id))]
@@ -161,6 +173,7 @@ impl UnikernelBuilder {
 
         container.image.replace(self.spec.build_image.clone());
         container.name = "build".to_string();
+        container.image_pull_policy.replace("Always".to_string());
         container
     }
     fn create_upload_container(&self) -> Container {
@@ -168,11 +181,11 @@ impl UnikernelBuilder {
         container.volume_mounts.replace(vec![VolumeMount {
             mount_path: "/input".to_string(),
             name: "build-to-upload".to_string(),
-            read_only: Some(true),
             ..VolumeMount::default()
         }]);
         container.image.replace((&self.spec.upload_image).clone());
         container.name = "upload".to_string();
+        container.image_pull_policy.replace("Always".to_string());
         container
     }
     fn create_export_container(&self) -> Container {
@@ -191,14 +204,18 @@ impl UnikernelBuilder {
             },
         ]);
         container.image.replace(self.spec.export_image.clone());
+        container.image_pull_policy.replace("Always".to_string());
         container.name = "export".to_string();
+        //container
+        //    .command
+        //    .replace(vec!["/usr/bin/sleep".to_string(), "1000".to_string()]);
         container
     }
 
     fn create_k8s_config_map_manifest(&self) -> ConfigMap {
         let mut config_map = ConfigMap::default();
         config_map.data.replace(BTreeMap::from([(
-            "data.yaml".to_string(),
+            "input.yaml".to_string(),
             serde_yaml::to_string(&self.spec).unwrap(),
         )]));
         config_map.immutable.replace(true);
@@ -220,46 +237,55 @@ impl UnikernelBuilder {
         format!("{}-build", self.name)
     }
 
-    fn create_persistent_volume(&self, owner_reference: OwnerReference) -> PersistentVolume {
-        let mut pv = PersistentVolume::default();
-        let mut pv_spec = PersistentVolumeSpec::default();
-        pv_spec.access_modes.replace(vec!["ReadWriteOnce".to_string()]);
-        pv_spec.capacity.replace(BTreeMap::from([(
-            "storage".to_string(),
-            Quantity("5Gi".to_string()),
-        )]));
-        pv_spec.host_path.replace(HostPathVolumeSource {
-            path: format!("/data/pv{}", self.name),
-            type_: None,
-        });
-        pv.spec.replace(pv_spec);
-        pv.metadata.name.replace(self.name.clone());
-        pv.metadata
-            .owner_references
-            .replace(vec![owner_reference.clone()]);
-        pv.metadata.labels.replace(BTreeMap::from([(
-            format!("{LABEL_PREFIX}/{OWNED_BY}"),
-            owner_reference.name,
-        )]));
-        return pv;
-    }
-
-    fn create_data_volume(&self, idx: usize) -> DataVolume {
-        DataVolume {
+    fn create_k8s_kubevirt_vm(&self, dv_name: String) -> VirtualMachine {
+        VirtualMachine {
             metadata: kube::core::ObjectMeta {
-                name: Some(self.get_data_volume_name(idx)),
                 owner_references: Some(vec![self.owner_reference.clone()]),
+                name: Some(self.name.clone()),
                 ..Default::default()
             },
-            spec: DataVolumeSpec {
-                pvc: Some(DataVolumePvc {
-                    access_modes: Some(vec!["ReadWriteOnce".to_string()]),
-                    resources: Some(DataVolumePvcResources {
-                        requests: Some(BTreeMap::from([("storage".to_string(), "500Mi".to_string())])),
+            spec: VirtualMachineSpec {
+                running: Some(true),
+                template: VirtualMachineTemplate {
+                    spec: Some(VirtualMachineTemplateSpec {
+                        termination_grace_period_seconds: Some(0),
+                        volumes: Some(vec![VirtualMachineTemplateSpecVolumes {
+                            data_volume: Some(VirtualMachineTemplateSpecVolumesDataVolume {
+                                name: dv_name,
+                                ..Default::default()
+                            }),
+                            name: "datavolumevolume".to_string(),
+                            ..Default::default()
+                        }]),
+                        domain: VirtualMachineTemplateSpecDomain {
+                            devices: VirtualMachineTemplateSpecDomainDevices {
+                                disks: Some(vec![VirtualMachineTemplateSpecDomainDevicesDisks {
+                                    disk: Some(VirtualMachineTemplateSpecDomainDevicesDisksDisk {
+                                        bus: Some("virtio".to_string()),
+                                        ..Default::default()
+                                    }),
+                                    name: "datavolumevolume".to_string(),
+                                    ..Default::default()
+                                }]),
+                                ..Default::default()
+                            },
+                            machine: Some(VirtualMachineTemplateSpecDomainMachine {
+                                r#type: Some("".to_string()),
+                                ..Default::default()
+                            }),
+                            resources: Some(VirtualMachineTemplateSpecDomainResources {
+                                requests: Some(BTreeMap::from([(
+                                    "memory".to_string(),
+                                    IntOrString::String("64M".to_string()),
+                                )])),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
                         ..Default::default()
                     }),
                     ..Default::default()
-                }),
+                },
                 ..Default::default()
             },
             status: None,
@@ -301,6 +327,7 @@ impl UnikernelBuilder {
         ]);
 
         pod_spec.restart_policy.replace("Never".to_string());
+        pod_spec.service_account.replace("image-upload".to_string());
         job_pod_template.spec.replace(pod_spec);
         job_spec.template = job_pod_template;
         job.spec.replace(job_spec);
@@ -313,10 +340,6 @@ impl UnikernelBuilder {
             self.name.clone(),
         )]));
         job
-    }
-
-    fn get_data_volume_name(&self, idx: usize) -> String {
-        format!("{}-{}", self.name, idx)
     }
 }
 
@@ -336,8 +359,38 @@ impl QuerySubmission {
         Ok(status)
     }
 
-    async fn deploying(&self, ctx: Arc<Context>) -> Result<QuerySubmissionStatus> {
+    async fn starting(&self, ctx: Arc<Context>) -> Result<QuerySubmissionStatus> {
         let mut status = self.status.as_ref().unwrap().clone();
+        status.state = QueryState::Starting;
+        Ok(status)
+    }
+
+    async fn deploymentPending(&self, ctx: Arc<Context>) -> Result<QuerySubmissionStatus> {
+        let mut status = self.status.as_ref().unwrap().clone();
+        status.state = QueryState::Deploying;
+        Ok(status)
+    }
+
+    async fn deploying(&self, ctx: Arc<Context>, dvs: Vec<DataVolume>) -> Result<QuerySubmissionStatus> {
+        let mut status = self.status.as_ref().unwrap().clone();
+        let vms: Api<VirtualMachine> = Api::namespaced(ctx.client.clone(), &self.namespace().unwrap());
+        let owner_reference = self
+            .controller_owner_ref(&())
+            .ok_or(Error::OwnerReferenceCreation(self.clone()))?;
+        let build = self.get_builder(self.name_any(), owner_reference);
+
+        let create_futures = dvs
+            .into_iter()
+            .map(|dv| dv.metadata.name.unwrap())
+            .map(|dv_name| build.create_k8s_kubevirt_vm(dv_name))
+            .map(|k8s_vm| {
+                let vms = vms.clone();
+                async move { vms.create(&PostParams::default(), &k8s_vm).await }
+            });
+
+        let _ = try_join_all(create_futures)
+            .await
+            .map_err(|e| Error::KubeError(e, "When Creating KubeVirt VMs"));
         status.state = QueryState::Deploying;
         Ok(status)
     }
@@ -412,12 +465,14 @@ impl QuerySubmission {
         Ok(status)
     }
 
-    async fn compute_next_action(&self, ctx: Arc<Context>) -> Result<QueryState> {
+    async fn compute_next_action(&self, ctx: Arc<Context>) -> Result<InternalQueryState> {
         let client = ctx.client.clone();
         let ns = self.namespace().unwrap();
         let name = self.name_any();
         let config_maps: Api<ConfigMap> = Api::namespaced(client.clone(), &ns);
         let jobs: Api<Job> = Api::namespaced(client.clone(), &ns);
+        let vms: Api<VirtualMachine> = Api::namespaced(client.clone(), &ns);
+        let datavolumes: Api<DataVolume> = Api::namespaced(client.clone(), &ns);
 
         if self.spec.topology.workers.is_empty() {
             return Err(Error::IllegalQuerySubmission);
@@ -429,14 +484,19 @@ impl QuerySubmission {
         find_owned_resources_options
             .label_selector
             .replace(format!("{LABEL_PREFIX}/{OWNED_BY}={name}"));
+        let dv_selector = ListParams { ..Default::default() };
+        let datavolumes = datavolumes.list(&dv_selector);
         let config_maps = config_maps.list(&find_owned_resources_options);
+        let vms = vms.list(&find_owned_resources_options);
         let jobs = jobs.list(&find_owned_resources_options);
-        let (config_maps, jobs) = tokio::join!(config_maps, jobs);
+        let (config_maps, vms, jobs, datavolumes) = tokio::join!(config_maps, vms, jobs, datavolumes);
+        let datavolumes = datavolumes.map_err(|e| Error::KubeError(e, "Get DataVolumes"))?;
         let config_maps = config_maps.map_err(|e| Error::KubeError(e, "Owned Config Maps"))?;
+        let vms = vms.map_err(|e| Error::KubeError(e, "Get VMs"))?;
         let jobs = jobs.map_err(|e| Error::KubeError(e, "Owned Jobs"))?;
 
         if config_maps.items.is_empty() {
-            return Ok(QueryState::Submitted);
+            return Ok(InternalQueryState::Submitted);
         }
 
         if config_maps.items.len() > 2 {
@@ -447,7 +507,7 @@ impl QuerySubmission {
         detect_spec_change(config_map, &build.create_k8s_config_map_manifest())?;
 
         if jobs.items.is_empty() {
-            return Ok(QueryState::Pending);
+            return Ok(InternalQueryState::Pending);
         }
 
         if jobs.items.len() > 2 {
@@ -464,8 +524,8 @@ impl QuerySubmission {
             let mut completed = false;
             let mut failed = false;
             for condition in status.conditions.iter().flat_map(|v| v.iter()) {
-                completed = completed || condition.reason.as_ref().unwrap() == "Completed";
-                failed = failed || condition.reason.as_ref().unwrap() == "Failure";
+                completed = completed || condition.type_ == "Complete";
+                failed = failed || condition.type_ == "Failed";
             }
 
             if failed {
@@ -474,13 +534,67 @@ impl QuerySubmission {
                 )));
             }
             if !completed {
-                return Ok(QueryState::Building);
+                return Ok(InternalQueryState::Building);
             }
         } else {
-            return Ok(QueryState::Pending);
+            return Ok(InternalQueryState::Pending);
         }
 
-        return Ok(QueryState::Deploying);
+        let all_data_volumes_ready = datavolumes.items.iter().all(|dv| {
+            if let Some(ref status) = dbg!(&dv).status {
+                return status.phase.as_ref().unwrap_or(&"".to_string()) == "Succeeded";
+            }
+            false
+        });
+
+        if !all_data_volumes_ready {
+            return Ok(InternalQueryState::Building);
+        }
+
+        if vms.items.is_empty() {
+            return Ok(InternalQueryState::Deploying(datavolumes.items));
+        }
+
+        for vm in vms.items.iter() {
+            let dv = datavolumes
+                .iter()
+                .filter(|dv| dv.metadata.name.as_ref().unwrap() == vm.metadata.name.as_ref().unwrap())
+                .collect::<Vec<_>>();
+            if dv.is_empty() {
+                return Err(Error::QuerySubmissionFailed(
+                    QuerySubmissionFailureReason::VMWithoutDataVolume(
+                        vm.metadata.name.as_ref().unwrap().clone(),
+                    ),
+                ));
+            }
+
+            let mut ready = false;
+            let mut failed = false;
+
+            for condition in vm
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .flat_map(|v| v.iter())
+            {
+                ready = ready || condition.r#type == "Ready";
+                failed = failed || condition.r#type == "Failed";
+            }
+
+            if failed {
+                return Err(Error::QuerySubmissionFailed(QuerySubmissionFailureReason::VM(
+                    "Don't know, sorry".to_string(),
+                )));
+            }
+
+            if !ready {
+                return Ok(InternalQueryState::DeploymentPending);
+            }
+        }
+
+        return Ok(InternalQueryState::Starting);
     }
     async fn change_config_map(&self) -> Result<QuerySubmissionStatus> {
         todo!()
@@ -507,14 +621,16 @@ impl QuerySubmission {
                 e => Err(e),
             },
             Ok(s) => match s {
-                QueryState::Submitted => self.init(ctx.clone()).await,
-                QueryState::Pending => self.pending(ctx.clone()).await,
-                QueryState::Building => self.building(ctx.clone()).await,
-                QueryState::Deploying => self.deploying(ctx.clone()).await,
-                QueryState::Running => {
+                InternalQueryState::Submitted => self.init(ctx.clone()).await,
+                InternalQueryState::Pending => self.pending(ctx.clone()).await,
+                InternalQueryState::Building => self.building(ctx.clone()).await,
+                InternalQueryState::Deploying(dvs) => self.deploying(ctx.clone(), dvs).await,
+                InternalQueryState::DeploymentPending => self.deploymentPending(ctx.clone()).await,
+                InternalQueryState::Starting => self.starting(ctx.clone()).await,
+                InternalQueryState::Running => {
                     todo!()
                 }
-                QueryState::Stopped => {
+                InternalQueryState::Stopped => {
                     todo!()
                 }
             },
@@ -538,6 +654,20 @@ impl QuerySubmission {
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action> {
+        let ns = self.namespace();
+        let client = &ctx.clone().client;
+        let datavolumes: Api<DataVolume> =
+            Api::namespaced(client.clone(), &ns.unwrap_or("default".to_string()));
+        let dv_selector = ListParams { ..Default::default() };
+        let dv_delete = DeleteParams { ..Default::default() };
+
+        let delete_dvs = datavolumes
+            .delete_collection(&dv_delete, &dv_selector)
+            .await
+            .map_err(|e| Error::KubeError(e, "Cleaning Up Datavolumes"))?;
+
+        info!("Deleted DataVolumes: {:?}", delete_dvs);
+
         let recorder = ctx.diagnostics.read().await.recorder(ctx.client.clone(), self);
         // QuerySubmission doesn't have any real cleanup, so we just publish an event
         recorder
